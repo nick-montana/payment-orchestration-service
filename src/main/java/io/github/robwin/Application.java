@@ -1,4 +1,4 @@
-package io.github.nickmontana;
+package io.github.robwin;
 
 
 import java.net.URI;
@@ -28,6 +28,10 @@ public class Application {
     private static Logger LOG = LoggerFactory.getLogger(Application.class);
 
     public static void main(String[] args) {
+        // bizevent-agent reads the non-standard JVM property "os.manufacturer" and crashes if it's missing
+        if (System.getProperty("os.manufacturer") == null) {
+            System.setProperty("os.manufacturer", "pharmacy-benefits-manager");
+        }
         SpringApplication.run(Application.class, args);
     }
 
