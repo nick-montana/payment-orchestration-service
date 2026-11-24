@@ -3,7 +3,7 @@ spring:
     jackson.serialization.indent_output: true
 
 server:
-    port: 9080
+    port: ${PORT}
 
 management.endpoints.web.exposure.include: '*'
 management.endpoint.health.show-details: always
@@ -14,9 +14,16 @@ management.health.ratelimiters.enabled: false
 
 management.dynatrace.metrics.export:
     enabled: true
+    enrich-with-dynatrace-metadata: true
     v2:
-        enrich-with-dynatrace-metadata: true
-
+        export-meter-metadata: false
+        default-dimensions:
+            region: ${REGION}
+logging:
+    level:
+        io:
+            micrometer:
+                dynatrace: DEBUG
 info:
     name: ${spring.application.name}
     description: resilience4j demo
@@ -24,6 +31,12 @@ info:
     version: 0.0.1
 
 management.metrics.tags.application: ${spring.application.name}
+# Datacenter this instance runs in, added to every metric as the "datacenter" dimension.
+# Defaults to prod-us-east-1 (port 9080). Start the second instance as prod-us-east-2 on port 8080 with:
+#   .\gradlew bootRun --args="--server.port=8080 --datacenter=prod-us-east-2"
+# (or set the DATACENTER environment variable)
+datacenter: ${DATACENTER:prod-us-east-1}
+management.metrics.tags.datacenter: ${datacenter}
 management.metrics.distribution.percentiles-histogram.http.server.requests: true
 management.metrics.distribution.percentiles-histogram.resilience4j.circuitbreaker.calls: true
 
@@ -116,6 +129,36 @@ resilience4j.circuitbreaker:
                 - org.springframework.web.client.HttpClientErrorException$TooManyRequests
                 - java.util.concurrent.TimeoutException
                 - java.io.IOException
+        # Customer profile / KYC: the healthy baseline; stays CLOSED unless switched to DEGRADED or DOWN
+        customer-profile:
+            baseConfig: default
+            slidingWindowSize: 20
+            minimumNumberOfCalls: 10
+            failureRateThreshold: 50
+            waitDurationInOpenState: 15s
+        # Sanctions screening: fail-closed compliance check, so the strictest threshold (25%).
+        # Each retry attempt is recorded separately, so reload-window errors open it quickly.
+        sanctions-screening:
+            baseConfig: default
+            slidingWindowSize: 20
+            minimumNumberOfCalls: 10
+            failureRateThreshold: 25
+            permittedNumberOfCallsInHalfOpenState: 5
+            waitDurationInOpenState: 30s
+        # FX market data: a 200 OK with a stale or off-market quote is a failure too, so InvalidQuoteException
+        # is added to this instance's recordExceptions alongside the usual HTTP/IO errors.
+        fx-rates:
+            baseConfig: default
+            slidingWindowSize: 20
+            minimumNumberOfCalls: 10
+            failureRateThreshold: 50
+            permittedNumberOfCallsInHalfOpenState: 3
+            waitDurationInOpenState: 20s
+            recordExceptions:
+                - org.springframework.web.client.HttpServerErrorException
+                - java.util.concurrent.TimeoutException
+                - java.io.IOException
+                - io.github.robwin.exception.InvalidQuoteException
 resilience4j.retry:
     configs:
         default:
@@ -132,6 +175,14 @@ resilience4j.retry:
             baseConfig: default
         backendB:
             baseConfig: default
+        # Two quick retries (250ms, then 500ms) before holding a payment for compliance review.
+        # CallNotPermittedException isn't in retryExceptions, so an OPEN breaker stops retries immediately.
+        sanctions-screening:
+            baseConfig: default
+            maxAttempts: 3
+            waitDuration: 250ms
+            enableExponentialBackoff: true
+            exponentialBackoffMultiplier: 2
 resilience4j.bulkhead:
     configs:
         default:
@@ -218,6 +269,42 @@ notification-service.simulation:
     mean-time-between-outages: 8m
     outage-min: 90s
     outage-max: 180s
+
+# Customer profile simulation (CustomerProfileService)
+# mode: HEALTHY | DEGRADED | DOWN. HEALTHY is the baseline; switch modes by hand to show an incident on demand.
+# The fallback serves cached profiles up to max-cache-staleness old, then a fail-safe default.
+# Change at runtime with: PUT /customers/mode/{mode}
+customer-profile.simulation:
+    mode: HEALTHY
+    baseline-error-probability: 0.005
+    degraded-error-probability: 0.5
+    max-cache-staleness: 30m
+
+# Sanctions screening simulation (SactionsScreeningService)
+# mode: HEALTHY | SCHEDULED | DOWN. SCHEDULED reloads the watchlist during the last refresh-window of every
+# cycle-length, when most calls fail with HTTP 503. Change at runtime with: PUT /sanctions/mode/{mode}
+sanctions-screening.simulation:
+    mode: SCHEDULED
+    cycle-length: 15m
+    refresh-window: 2m
+    refresh-error-probability: 0.7
+    baseline-error-probability: 0.01
+    potential-match-probability: 0.03
+
+# FX rate simulation (ForeignExchangeRateService)
+# mode: HEALTHY | FLAKY | FROZEN | DOWN. FLAKY has 2% HTTP errors, rare off-market ticks, and random feed
+# freezes where quotes go stale after max-quote-age. Cached rates are used up to cache-ttl old.
+# Change at runtime with: PUT /fx/mode/{mode}
+fx-rates.simulation:
+    mode: FLAKY
+    max-quote-age: 5s
+    off-market-threshold: 0.03
+    cache-ttl: 10m
+    baseline-error-probability: 0.02
+    off-market-probability: 0.01
+    mean-time-between-freezes: 6m
+    freeze-min: 60s
+    freeze-max: 150s
 
 resilience4j.timelimiter:
     configs:
